@@ -2,7 +2,8 @@
 
 mod addons;
 use addons::{
-    decrypt_audio_frame, decrypt_payload, derive_chat_key, encrypt_audio_frame, encrypt_payload,
+    clear_session, decrypt_audio_frame, decrypt_payload, derive_chat_key,
+    encrypt_audio_frame, encrypt_payload, load_session, save_session, SavedSession,
     SoundPlayer,
 };
 
@@ -1866,7 +1867,23 @@ impl EgrammApp {
 
         cc.egui_ctx.set_fonts(fonts);
 
-        let app = Self::default();
+        let mut app = Self::default();
+        if let Some(saved) = load_session() {
+            app.username = saved.name;
+            app.user_email = saved.email.clone();
+            app.user_avatar_id = saved.avatar_file_id.clone();
+            app.user_bio = saved.bio;
+            app.audio_bridge.set_my_email(saved.email.clone());
+            let nick = saved.email.split('@').next().unwrap_or("user");
+            app.user_tag = format!("@{}", nick);
+            app.session_token = Some(saved.session_token);
+            app.is_logged_in = true;
+            app.has_played_intro = true;
+            if let Some(fid) = saved.avatar_file_id {
+                app.request_avatar_download(&cc.egui_ctx, &fid);
+            }
+            app.start_realtime_sync(cc.egui_ctx.clone());
+        }
         let palette = app.palette();
         apply_theme_style(&cc.egui_ctx, &palette, app.is_dark_mode);
         app
@@ -5364,7 +5381,14 @@ impl eframe::App for EgrammApp {
                     self.audio_bridge.set_my_email(email.clone());
                     let nick = email.split('@').next().unwrap_or("user");
                     self.user_tag = format!("@{}", nick);
-                    self.session_token = Some(token);
+                    self.session_token = Some(token.clone());
+                    save_session(&SavedSession {
+                        name: name.clone(),
+                        email: email.clone(),
+                        session_token: token,
+                        avatar_file_id: self.user_avatar_id.clone(),
+                        bio: self.user_bio.clone(),
+                    });
                     self.is_authenticating = false;
                     self.auth_url = None;
                     self.auth_error = None;
@@ -6988,6 +7012,7 @@ impl eframe::App for EgrammApp {
                             self.menu_open = false;
                             self.is_logged_in = false;
                             self.session_token = None;
+                            clear_session();
                             self.ws_out_tx = None;
                             self.ws_connected = false;
                             self.online_emails.clear();

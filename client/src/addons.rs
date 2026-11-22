@@ -233,3 +233,39 @@ impl Drop for SoundPlayer {
         self.stop_ringtone();
     }
 }
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct SavedSession {
+    pub name: String,
+    pub email: String,
+    pub session_token: String,
+    pub avatar_file_id: Option<String>,
+    pub bio: String,
+}
+
+fn session_file_path() -> std::path::PathBuf {
+    let base = std::env::var("APPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let dir = base.join("Egramm");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("session.json")
+}
+
+pub fn save_session(session: &SavedSession) {
+    if let Ok(json) = serde_json::to_string_pretty(session) {
+        let _ = std::fs::write(session_file_path(), json);
+    }
+}
+
+pub fn load_session() -> Option<SavedSession> {
+    let raw = std::fs::read_to_string(session_file_path()).ok()?;
+    let sess: SavedSession = serde_json::from_str(&raw).ok()?;
+    if sess.session_token.trim().is_empty() || sess.email.trim().is_empty() {
+        return None;
+    }
+    Some(sess)
+}
+
+pub fn clear_session() {
+    let _ = std::fs::remove_file(session_file_path());
+}
