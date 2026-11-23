@@ -28,9 +28,10 @@ use uuid::Uuid;
 
 const MAX_CALL_PARTICIPANTS: usize = 4;
 const MAX_PENDING_AUTHS: usize = 500;
-const MAX_WS_FRAME_BYTES: usize = 64 * 1024;
+const MAX_WS_FRAME_BYTES: usize = 768 * 1024;
 const MAX_MESSAGE_LEN: usize = 16_000;
 const MAX_AUDIO_B64_LEN: usize = 16_384;
+const MAX_SCREEN_B64_LEN: usize = 512 * 1024;
 
 struct PendingAuth {
     created_at: Instant,
@@ -93,6 +94,12 @@ struct StoredAttachment {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+struct ReactionDto {
+    emoji: String,
+    users: Vec<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 struct ChatMessageDto {
     id: i64,
     chat_id: i64,
@@ -102,6 +109,14 @@ struct ChatMessageDto {
     time: String,
     encrypted: bool,
     is_read: bool,
+    #[serde(default)]
+    reply_to_id: Option<i64>,
+    #[serde(default)]
+    reply_to_sender: Option<String>,
+    #[serde(default)]
+    reply_to_preview: Option<String>,
+    #[serde(default)]
+    reactions: Vec<ReactionDto>,
     attachment: Option<StoredAttachment>,
 }
 
@@ -129,6 +144,8 @@ struct ChatDto {
     peer_avatar_id: Option<String>,
     peer_bio: String,
     peer_online: bool,
+    #[serde(default)]
+    creator_email: Option<String>,
     members: Vec<GroupMemberDto>,
     messages: Vec<ChatMessageDto>,
 }
@@ -241,15 +258,41 @@ enum WsEvent {
         chat_id: i64,
         text: String,
         encrypted: Option<bool>,
+        #[serde(default)]
+        reply_to_id: Option<i64>,
+        #[serde(default)]
+        reply_to_sender: Option<String>,
+        #[serde(default)]
+        reply_to_preview: Option<String>,
         attachment: Option<StoredAttachment>,
     },
     #[serde(rename = "new_message")]
     NewMessage { message: ChatMessageDto },
+    #[serde(rename = "toggle_reaction")]
+    ToggleReaction {
+        session_token: String,
+        chat_id: i64,
+        message_id: i64,
+        emoji: String,
+    },
+    #[serde(rename = "reaction_updated")]
+    ReactionUpdated {
+        chat_id: i64,
+        message_id: i64,
+        reactions: Vec<ReactionDto>,
+    },
     #[serde(rename = "new_chat")]
     NewChat {
         chat: ChatDto,
         allowed_emails: Vec<String>,
     },
+    #[serde(rename = "delete_group")]
+    DeleteGroup {
+        session_token: String,
+        chat_id: i64,
+    },
+    #[serde(rename = "chat_deleted")]
+    ChatDeleted { chat_id: i64 },
     #[serde(rename = "mark_read")]
     MarkRead {
         session_token: String,
@@ -337,6 +380,31 @@ enum WsEvent {
         channels: u16,
         pcm_b64: String,
     },
+    #[serde(rename = "call_screen_frame")]
+    CallScreenFrame {
+        #[serde(default)]
+        session_token: String,
+        chat_id: i64,
+        #[serde(default)]
+        call_id: String,
+        #[serde(default)]
+        sender_email: String,
+        #[serde(default)]
+        sender_name: String,
+        width: u32,
+        height: u32,
+        jpeg_b64: String,
+    },
+    #[serde(rename = "call_screen_stop")]
+    CallScreenStop {
+        #[serde(default)]
+        session_token: String,
+        chat_id: i64,
+        #[serde(default)]
+        call_id: String,
+        #[serde(default)]
+        sender_email: String,
+    },
 }
 
 struct ActiveCall {
@@ -423,7 +491,8 @@ fn init_database(conn: &Connection) -> rusqlite::Result<()> {
             avatar_tag TEXT NOT NULL,
             is_group INTEGER NOT NULL,
             description TEXT NOT NULL DEFAULT '',
-            avatar_file_id TEXT
+            avatar_file_id TEXT,
+            creator_email TEXT
         );
 
         CREATE TABLE IF NOT EXISTS chat_members (
@@ -441,15 +510,26 @@ fn init_database(conn: &Connection) -> rusqlite::Result<()> {
             time TEXT NOT NULL,
             encrypted INTEGER NOT NULL DEFAULT 1,
             is_read INTEGER NOT NULL DEFAULT 0,
+            reply_to_id INTEGER,
+            reply_to_sender TEXT,
+            reply_to_preview TEXT,
             att_kind TEXT,
             att_title TEXT,
             att_subtitle TEXT,
             att_drive_id TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS message_reactions (
+            message_id INTEGER NOT NULL,
+            user_email TEXT NOT NULL,
+            emoji TEXT NOT NULL,
+            PRIMARY KEY (message_id, user_email, emoji)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id, id);
         CREATE INDEX IF NOT EXISTS idx_chat_members_user ON chat_members(user_email);
         CREATE INDEX IF NOT EXISTS idx_sessions_email ON sessions(email);
+        CREATE INDEX IF NOT EXISTS idx_reactions_msg ON message_reactions(message_id);
         ",
     )?;
 
@@ -467,6 +547,7 @@ fn init_database(conn: &Connection) -> rusqlite::Result<()> {
         [],
     );
     let _ = conn.execute("ALTER TABLE chats ADD COLUMN avatar_file_id TEXT", []);
+    let _ = conn.execute("ALTER TABLE chats ADD COLUMN creator_email TEXT", []);
     let _ = conn.execute(
         "ALTER TABLE messages ADD COLUMN encrypted INTEGER NOT NULL DEFAULT 1",
         [],
@@ -475,6 +556,9 @@ fn init_database(conn: &Connection) -> rusqlite::Result<()> {
         "ALTER TABLE messages ADD COLUMN is_read INTEGER NOT NULL DEFAULT 0",
         [],
     );
+    let _ = conn.execute("ALTER TABLE messages ADD COLUMN reply_to_id INTEGER", []);
+    let _ = conn.execute("ALTER TABLE messages ADD COLUMN reply_to_sender TEXT", []);
+    let _ = conn.execute("ALTER TABLE messages ADD COLUMN reply_to_preview TEXT", []);
 
     if let Ok(mut stmt) = conn.prepare("SELECT id, invite_code FROM chats WHERE is_group = 1") {
         let rows: Vec<(i64, String)> = stmt
@@ -507,6 +591,32 @@ fn init_database(conn: &Connection) -> rusqlite::Result<()> {
     );
 
     Ok(())
+}
+
+fn load_reactions_for_message(db: &Connection, message_id: i64) -> Vec<ReactionDto> {
+    let Ok(mut stmt) = db.prepare(
+        "SELECT emoji, user_email FROM message_reactions WHERE message_id = ?1 ORDER BY rowid ASC",
+    ) else {
+        return Vec::new();
+    };
+    let mut grouped: Vec<ReactionDto> = Vec::new();
+    if let Ok(rows) = stmt.query_map(params![message_id], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    }) {
+        for (emoji, user_email) in rows.filter_map(Result::ok) {
+            if let Some(existing) = grouped.iter_mut().find(|rx| rx.emoji == emoji) {
+                if !existing.users.contains(&user_email) {
+                    existing.users.push(user_email);
+                }
+            } else {
+                grouped.push(ReactionDto {
+                    emoji,
+                    users: vec![user_email],
+                });
+            }
+        }
+    }
+    grouped
 }
 
 impl AppState {
@@ -1204,6 +1314,7 @@ async fn open_dm_chat(
                     peer_avatar_id: target_avatar_id,
                     peer_bio: target_bio,
                     peer_online: target_is_on,
+                    creator_email: None,
                     members: Vec::new(),
                     messages: Vec::new(),
                 });
@@ -1227,6 +1338,7 @@ async fn open_dm_chat(
                     peer_avatar_id: my_avatar_id,
                     peer_bio: my_bio,
                     peer_online: my_is_on,
+                    creator_email: None,
                     members: Vec::new(),
                     messages: Vec::new(),
                 });
@@ -1305,8 +1417,8 @@ async fn create_chat(
         };
 
         db.execute(
-            "INSERT INTO chats (invite_code, title, subtitle, avatar_tag, is_group, description, avatar_file_id) VALUES ('', ?1, ?2, ?3, 1, ?4, ?5)",
-            params![title, subtitle, avatar_tag, description, req.avatar_file_id],
+            "INSERT INTO chats (invite_code, title, subtitle, avatar_tag, is_group, description, avatar_file_id, creator_email) VALUES ('', ?1, ?2, ?3, 1, ?4, ?5, ?6)",
+            params![title, subtitle, avatar_tag, description, req.avatar_file_id, creator_email],
         )
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -1476,6 +1588,7 @@ fn load_single_chat_for_user(
         description,
         group_avatar_id,
         invite_code,
+        creator_email,
     ): (
         String,
         String,
@@ -1484,8 +1597,9 @@ fn load_single_chat_for_user(
         String,
         Option<String>,
         String,
+        Option<String>,
     ) = db.query_row(
-        "SELECT title, subtitle, avatar_tag, is_group, description, avatar_file_id, invite_code FROM chats WHERE id = ?1",
+        "SELECT title, subtitle, avatar_tag, is_group, description, avatar_file_id, invite_code, creator_email FROM chats WHERE id = ?1",
         params![chat_id],
         |r| {
             Ok((
@@ -1496,6 +1610,7 @@ fn load_single_chat_for_user(
                 r.get(4)?,
                 r.get(5)?,
                 r.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                r.get(7)?,
             ))
         },
     )?;
@@ -1559,28 +1674,29 @@ fn load_single_chat_for_user(
     }
 
     let mut msg_stmt = db.prepare(
-        "SELECT id, chat_id, sender_email, sender_name, text, time, encrypted, is_read, att_kind, att_title, att_subtitle, att_drive_id
+        "SELECT id, chat_id, sender_email, sender_name, text, time, encrypted, is_read, reply_to_id, reply_to_sender, reply_to_preview, att_kind, att_title, att_subtitle, att_drive_id
          FROM messages WHERE chat_id = ?1 ORDER BY id ASC",
     )?;
 
     let messages: Vec<ChatMessageDto> = msg_stmt
         .query_map(params![chat_id], |row| {
-            let att_kind: Option<String> = row.get(8)?;
+            let msg_id: i64 = row.get(0)?;
+            let att_kind: Option<String> = row.get(11)?;
             let attachment = att_kind.map(|kind| StoredAttachment {
                 kind,
                 title: row
-                    .get::<_, Option<String>>(9)
+                    .get::<_, Option<String>>(12)
                     .unwrap_or_default()
                     .unwrap_or_default(),
                 subtitle: row
-                    .get::<_, Option<String>>(10)
+                    .get::<_, Option<String>>(13)
                     .unwrap_or_default()
                     .unwrap_or_default(),
-                drive_file_id: row.get(11).unwrap_or(None),
+                drive_file_id: row.get(14).unwrap_or(None),
             });
 
             Ok(ChatMessageDto {
-                id: row.get(0)?,
+                id: msg_id,
                 chat_id: row.get(1)?,
                 sender_email: row.get(2)?,
                 sender_name: row.get(3)?,
@@ -1588,6 +1704,10 @@ fn load_single_chat_for_user(
                 time: row.get(5)?,
                 encrypted: row.get::<_, i64>(6).unwrap_or(1) != 0,
                 is_read: row.get::<_, i64>(7).unwrap_or(0) != 0,
+                reply_to_id: row.get(8).unwrap_or(None),
+                reply_to_sender: row.get(9).unwrap_or(None),
+                reply_to_preview: row.get(10).unwrap_or(None),
+                reactions: load_reactions_for_message(db, msg_id),
                 attachment,
             })
         })?
@@ -1607,6 +1727,7 @@ fn load_single_chat_for_user(
         peer_avatar_id,
         peer_bio,
         peer_online,
+        creator_email,
         members,
         messages,
     })
@@ -1800,6 +1921,16 @@ fn leave_call_and_notify(state: &AppState, chat_id: i64, actor_email: &str) {
     if let Some((call_id, remaining)) = action {
         let targets = state.chat_member_emails(chat_id);
         state.send_ws(
+            Some(targets.clone()),
+            Some(actor_email.to_string()),
+            &WsEvent::CallScreenStop {
+                session_token: String::new(),
+                chat_id,
+                call_id: call_id.clone(),
+                sender_email: actor_email.to_string(),
+            },
+        );
+        state.send_ws(
             Some(targets),
             None,
             &WsEvent::CallHangup {
@@ -1872,6 +2003,47 @@ async fn handle_ws_socket(mut socket: WebSocket, state: Arc<AppState>) {
                             WsEvent::AuthWs { session_token } => {
                                 bind_socket_session(&state, &mut authed_email, &session_token);
                             }
+                            WsEvent::DeleteGroup { session_token, chat_id } => {
+                                bind_socket_session(&state, &mut authed_email, &session_token);
+                                let deleted_targets = {
+                                    let Some((_, _, is_group, members)) =
+                                        state.verify_member_with_info(&session_token, chat_id)
+                                    else {
+                                        continue;
+                                    };
+                                    if !is_group {
+                                        continue;
+                                    }
+                                    let Ok(db) = state.db.lock() else { continue };
+                                    let _ = db.execute(
+                                        "DELETE FROM message_reactions WHERE message_id IN (SELECT id FROM messages WHERE chat_id = ?1)",
+                                        params![chat_id],
+                                    );
+                                    let _ = db.execute(
+                                        "DELETE FROM messages WHERE chat_id = ?1",
+                                        params![chat_id],
+                                    );
+                                    let _ = db.execute(
+                                        "DELETE FROM chat_members WHERE chat_id = ?1",
+                                        params![chat_id],
+                                    );
+                                    let ok = db
+                                        .execute("DELETE FROM chats WHERE id = ?1", params![chat_id])
+                                        .map(|rows| rows > 0)
+                                        .unwrap_or(false);
+                                    if ok { Some(members) } else { None }
+                                };
+                                if let Some(targets) = deleted_targets {
+                                    if let Ok(mut calls) = state.active_calls.lock() {
+                                        calls.remove(&chat_id);
+                                    }
+                                    state.send_ws(
+                                        Some(targets),
+                                        None,
+                                        &WsEvent::ChatDeleted { chat_id },
+                                    );
+                                }
+                            }
                             WsEvent::ProfileUpdated { session_token, name, tag, bio, .. } => {
                                 bind_socket_session(&state, &mut authed_email, &session_token);
                                 let updated = {
@@ -1905,7 +2077,16 @@ async fn handle_ws_socket(mut socket: WebSocket, state: Arc<AppState>) {
                                     },
                                 );
                             }
-                            WsEvent::SendMessage { session_token, chat_id, text, encrypted, attachment } => {
+                            WsEvent::SendMessage {
+                                session_token,
+                                chat_id,
+                                text,
+                                encrypted,
+                                reply_to_id,
+                                reply_to_sender,
+                                reply_to_preview,
+                                attachment,
+                            } => {
                                 bind_socket_session(&state, &mut authed_email, &session_token);
                                 if text.len() > MAX_MESSAGE_LEN {
                                     continue;
@@ -1932,8 +2113,22 @@ async fn handle_ws_socket(mut socket: WebSocket, state: Arc<AppState>) {
                                     };
 
                                     if db.execute(
-                                        "INSERT INTO messages (chat_id, sender_email, sender_name, text, time, encrypted, is_read, att_kind, att_title, att_subtitle, att_drive_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9, ?10)",
-                                        params![chat_id, sender_email, sender_name, text, time_str, if is_enc { 1 } else { 0 }, ak, at, asub, adrive],
+                                        "INSERT INTO messages (chat_id, sender_email, sender_name, text, time, encrypted, is_read, reply_to_id, reply_to_sender, reply_to_preview, att_kind, att_title, att_subtitle, att_drive_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                                        params![
+                                            chat_id,
+                                            sender_email,
+                                            sender_name,
+                                            text,
+                                            time_str,
+                                            if is_enc { 1 } else { 0 },
+                                            reply_to_id,
+                                            reply_to_sender,
+                                            reply_to_preview,
+                                            ak,
+                                            at,
+                                            asub,
+                                            adrive
+                                        ],
                                     ).is_ok() {
                                         let id = db.last_insert_rowid();
                                         Some((
@@ -1946,6 +2141,10 @@ async fn handle_ws_socket(mut socket: WebSocket, state: Arc<AppState>) {
                                                 time: time_str,
                                                 encrypted: is_enc,
                                                 is_read: false,
+                                                reply_to_id,
+                                                reply_to_sender,
+                                                reply_to_preview,
+                                                reactions: Vec::new(),
                                                 attachment,
                                             },
                                             members,
@@ -1962,6 +2161,72 @@ async fn handle_ws_socket(mut socket: WebSocket, state: Arc<AppState>) {
                                         &WsEvent::NewMessage { message: new_msg },
                                     );
                                 }
+                            }
+                            WsEvent::ToggleReaction {
+                                session_token,
+                                chat_id,
+                                message_id,
+                                emoji,
+                            } => {
+                                bind_socket_session(&state, &mut authed_email, &session_token);
+                                let clean_emoji = truncate_chars(&emoji, 16);
+                                if clean_emoji.is_empty() {
+                                    continue;
+                                }
+                                let updated = {
+                                    let Some((_, user_email, _, members)) =
+                                        state.verify_member_with_info(&session_token, chat_id)
+                                    else {
+                                        continue;
+                                    };
+                                    let Ok(db) = state.db.lock() else { continue };
+
+                                    let msg_exists: bool = db
+                                        .query_row(
+                                            "SELECT COUNT(*) FROM messages WHERE id = ?1 AND chat_id = ?2",
+                                            params![message_id, chat_id],
+                                            |r| r.get::<_, i64>(0),
+                                        )
+                                        .map(|c| c > 0)
+                                        .unwrap_or(false);
+                                    if !msg_exists {
+                                        continue;
+                                    }
+
+                                    let already: bool = db
+                                        .query_row(
+                                            "SELECT COUNT(*) FROM message_reactions WHERE message_id = ?1 AND user_email = ?2 AND emoji = ?3",
+                                            params![message_id, user_email, clean_emoji],
+                                            |r| r.get::<_, i64>(0),
+                                        )
+                                        .map(|c| c > 0)
+                                        .unwrap_or(false);
+
+                                    if already {
+                                        let _ = db.execute(
+                                            "DELETE FROM message_reactions WHERE message_id = ?1 AND user_email = ?2 AND emoji = ?3",
+                                            params![message_id, user_email, clean_emoji],
+                                        );
+                                    } else {
+                                        let _ = db.execute(
+                                            "INSERT OR IGNORE INTO message_reactions (message_id, user_email, emoji) VALUES (?1, ?2, ?3)",
+                                            params![message_id, user_email, clean_emoji],
+                                        );
+                                    }
+
+                                    let reactions = load_reactions_for_message(&db, message_id);
+                                    (reactions, members)
+                                };
+
+                                state.send_ws(
+                                    Some(updated.1),
+                                    None,
+                                    &WsEvent::ReactionUpdated {
+                                        chat_id,
+                                        message_id,
+                                        reactions: updated.0,
+                                    },
+                                );
                             }
                             WsEvent::MarkRead { session_token, chat_id } => {
                                 bind_socket_session(&state, &mut authed_email, &session_token);
@@ -2294,6 +2559,100 @@ async fn handle_ws_socket(mut socket: WebSocket, state: Arc<AppState>) {
                                             sample_rate,
                                             channels,
                                             pcm_b64,
+                                        },
+                                    );
+                                }
+                            }
+                            WsEvent::CallScreenFrame {
+                                session_token,
+                                chat_id,
+                                call_id,
+                                sender_name,
+                                width,
+                                height,
+                                jpeg_b64,
+                                ..
+                            } => {
+                                if jpeg_b64.is_empty() || jpeg_b64.len() > MAX_SCREEN_B64_LEN {
+                                    continue;
+                                }
+                                if authed_email.is_none() {
+                                    bind_socket_session(&state, &mut authed_email, &session_token);
+                                }
+                                let Some(sender_email) = authed_email.clone() else {
+                                    continue;
+                                };
+
+                                let targets: Option<HashSet<String>> = state
+                                    .active_calls
+                                    .lock()
+                                    .ok()
+                                    .and_then(|calls| {
+                                        let call = calls.get(&chat_id)?;
+                                        if call.participants.contains(&sender_email) {
+                                            Some(call.participants.clone())
+                                        } else {
+                                            None
+                                        }
+                                    });
+
+                                if let Some(targets) = targets {
+                                    let clean_name = if sender_name.trim().is_empty() {
+                                        sender_email.clone()
+                                    } else {
+                                        truncate_chars(&sender_name, 64)
+                                    };
+                                    state.send_ws(
+                                        Some(targets),
+                                        Some(sender_email.clone()),
+                                        &WsEvent::CallScreenFrame {
+                                            session_token: String::new(),
+                                            chat_id,
+                                            call_id,
+                                            sender_email,
+                                            sender_name: clean_name,
+                                            width,
+                                            height,
+                                            jpeg_b64,
+                                        },
+                                    );
+                                }
+                            }
+                            WsEvent::CallScreenStop {
+                                session_token,
+                                chat_id,
+                                call_id,
+                                ..
+                            } => {
+                                if authed_email.is_none() {
+                                    bind_socket_session(&state, &mut authed_email, &session_token);
+                                }
+                                let Some(sender_email) = authed_email.clone() else {
+                                    continue;
+                                };
+
+                                let targets: Option<HashSet<String>> = state
+                                    .active_calls
+                                    .lock()
+                                    .ok()
+                                    .and_then(|calls| {
+                                        let call = calls.get(&chat_id)?;
+                                        if call.participants.contains(&sender_email) {
+                                            Some(call.participants.clone())
+                                        } else {
+                                            None
+                                        }
+                                    });
+
+                                if let Some(targets) = targets {
+                                    state.send_ws(
+                                        Some(targets),
+                                        Some(sender_email.clone()),
+                                        &WsEvent::CallScreenStop {
+                                            session_token: String::new(),
+                                            chat_id,
+                                            call_id,
+                                            sender_email,
                                         },
                                     );
                                 }
